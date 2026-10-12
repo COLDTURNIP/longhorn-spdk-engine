@@ -2,6 +2,7 @@ package spdk
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net"
@@ -683,14 +684,14 @@ func (r *Replica) syncCloneReplicaInfo(spdkClient *spdkclient.Client, bdevLvolMa
 
 	actualParent := rootBdev.DriverSpecific.Lvol.BaseSnapshot
 
-	// Case 1: The chain root's parent is the expected entrypoint — also verify that
+	// Case 1: The chain root's parent is the expected entrypoint -- also verify that
 	// the entrypoint itself is correctly parented to the src snapshot.
 	// The entrypoint may have become an orphaned root (empty base_snapshot) if the
 	// src replica was rebuilt: rebuildingDstShallowCopyPrepare detaches all children
 	// of a corrupted or outdated snapshot, including any clone entrypoints, before
 	// deleting or reusing the snapshot. If the instance manager restarted before
 	// RebuildingDstSnapshotCreate could re-parent the entrypoint, the orphaned
-	// entrypoint persists. The chain-root → entrypoint link uses lvol names (not
+	// entrypoint persists. The chain-root -> entrypoint link uses lvol names (not
 	// UUIDs), so it survives the rebuild even though the entrypoint is broken.
 	if actualParent == r.cloneEntrypointLvolName {
 		expectedSrcSnapshotLvolName := GetReplicaSnapshotLvolName(r.cloneSourceReplicaName, r.cloneSourceSnapshotName)
@@ -1342,7 +1343,7 @@ func constructSnapshotLvolMap(replicaName string, bdevLvolMap map[string]*spdkty
 			continue
 		}
 		for _, childLvolName := range bdevLvolMap[curSvcLvol.Name].DriverSpecific.Lvol.Clones {
-			// Exclude clone entrypoint lvols — they are tracked separately
+			// Exclude clone entrypoint lvols -- they are tracked separately
 			if IsCloneEntrypointOfReplica(replicaName, childLvolName) || IsCloneEntrypointTmpHeadLvol(childLvolName) {
 				delete(curSvcLvol.Children, childLvolName)
 				continue
@@ -1608,7 +1609,7 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 			r.reconstructRequired = true
 		}
 
-		// Rebuild interrupted — SnapshotLvolMap is stale.
+		// Rebuild interrupted -- SnapshotLvolMap is stale.
 		if r.State == types.InstanceStateStopped && wasRebuilding && !cleanupRequired {
 			r.reconstructRequired = true
 		}
@@ -1742,89 +1743,319 @@ func (r *Replica) Get() (pReplica *spdkrpc.Replica) {
 	return ServiceReplicaToProtoReplica(r)
 }
 
-func (r *Replica) Expand(spdkClient *spdkclient.Client, size uint64) error {
-	r.Lock()
-	defer r.Unlock()
+// Caller holds r.Lock. Permanent clone relationships are not busy operations.
+// Do not repair or reparent here: Sync and clone/rebuild paths own that work.
+func (r *Replica) validateExpansionEligibilityNoLock() error {
+	if r.State != types.InstanceStateRunning {
+		return fmt.Errorf("replica %s is not running: %s", r.Name, r.State)
+	}
+	if r.isRebuilding || r.rebuildingSrcCache.dstReplicaName != "" {
+		return fmt.Errorf("replica %s has an active rebuild operation", r.Name)
+	}
+	if r.isRestoring {
+		return fmt.Errorf("replica %s has an active restore operation", r.Name)
+	}
+	if r.isSnapshotCloning || len(r.snapshotCloningSrcCache) != 0 {
+		return fmt.Errorf("replica %s has an active clone operation", r.Name)
+	}
+	if r.Head == nil || r.Head.Name != r.Name || r.Head.Alias != r.Alias {
+		return fmt.Errorf("replica %s requires an existing writable head", r.Name)
+	}
+	if len(r.ActiveChain) < 2 || r.ActiveChain[len(r.ActiveChain)-1] != r.Head {
+		return fmt.Errorf("replica %s has an inconsistent active chain", r.Name)
+	}
+	return nil
+}
 
-	r.log.Infof("Expanding replica %s to size %v", r.Name, size)
+// Query only; the dedicated RPC connection bounds the SPDK wait. Scope names to
+// this lvstore so another disk's identically named lvol cannot satisfy a check.
+func (r *Replica) getExpansionLvolsNoLock(ctx context.Context) (map[string]*spdktypes.BdevInfo, error) {
+	var bdevs []spdktypes.BdevInfo
+	if err := expansionRPC(ctx, "bdev_get_bdevs", map[string]any{}, &bdevs); err != nil {
+		return nil, err
+	}
+	lvols := map[string]*spdktypes.BdevInfo{}
+	for i := range bdevs {
+		bdev := &bdevs[i]
+		if bdev.DriverSpecific == nil || bdev.DriverSpecific.Lvol == nil || len(bdev.Aliases) != 1 ||
+			spdktypes.GetLvsNameFromAlias(bdev.Aliases[0]) != r.LvsName || bdev.DriverSpecific.Lvol.LvolStoreUUID != r.LvsUUID {
+			continue
+		}
+		name := spdktypes.GetLvolNameFromAlias(bdev.Aliases[0])
+		if _, exists := lvols[name]; exists {
+			return nil, fmt.Errorf("duplicate lvol %s in lvstore %s", name, r.LvsName)
+		}
+		lvols[name] = bdev
+	}
+	return lvols, nil
+}
 
+// Walk the actual read-only ancestry, not parent capacity: a writable clone may
+// legitimately grow beyond its immutable parent. Detect missing links/cycles.
+func getExpansionLvolAncestry(name string, lvols map[string]*spdktypes.BdevInfo) ([]string, error) {
+	chain := []string{}
+	seen := map[string]bool{}
+	for name != "" {
+		if seen[name] {
+			return nil, fmt.Errorf("lvol ancestry contains a cycle at %s", name)
+		}
+		seen[name] = true
+		bdev := lvols[name]
+		if bdev == nil || bdev.UUID == "" || bdev.DriverSpecific == nil || bdev.DriverSpecific.Lvol == nil {
+			return nil, fmt.Errorf("lvol ancestry is missing lvol %s", name)
+		}
+		if len(chain) != 0 && !bdev.DriverSpecific.Lvol.Snapshot {
+			return nil, fmt.Errorf("lvol ancestor %s is not a snapshot", name)
+		}
+		chain = append(chain, name)
+		name = bdev.DriverSpecific.Lvol.BaseSnapshot
+	}
+	return chain, nil
+}
+
+func (r *Replica) validateExpansionTopologyNoLock(lvols map[string]*spdktypes.BdevInfo) error {
+	ancestry, err := getExpansionLvolAncestry(r.Name, lvols)
+	if err != nil {
+		return err
+	}
+	head := lvols[r.Name]
+	if head.UUID != r.Head.UUID || head.DriverSpecific.Lvol.Snapshot || len(head.DriverSpecific.Lvol.Clones) != 0 {
+		return fmt.Errorf("replica %s head identity or writable-leaf status changed", r.Name)
+	}
+	for i, cached := range r.ActiveChain {
+		if cached == nil {
+			if i != 0 || len(ancestry) != len(r.ActiveChain)-1 {
+				return fmt.Errorf("replica %s has a missing cached ancestor", r.Name)
+			}
+			continue
+		}
+		actual := lvols[cached.Name]
+		if actual == nil || actual.DriverSpecific == nil || actual.DriverSpecific.Lvol == nil ||
+			actual.UUID != cached.UUID || actual.DriverSpecific.Lvol.BaseSnapshot != cached.Parent {
+			return fmt.Errorf("replica %s cached lvol %s topology changed", r.Name, cached.Name)
+		}
+		if i > 0 {
+			parent := r.ActiveChain[i-1]
+			expected := ""
+			if parent != nil {
+				expected = parent.Name
+			}
+			if cached.Parent != expected {
+				return fmt.Errorf("replica %s cached parent of %s is inconsistent", r.Name, cached.Name)
+			}
+		}
+	}
+	if r.isCloneReplica {
+		epName := GetCloneEntrypointLvolName(r.cloneSourceReplicaName, r.cloneSourceSnapshotName)
+		if r.cloneSourceReplicaName == "" || r.cloneSourceSnapshotName == "" || r.cloneEntrypointLvolName != epName ||
+			r.ActiveChain[0] == nil || r.ActiveChain[0].Name != epName || !slices.Contains(ancestry, epName) {
+			return fmt.Errorf("replica %s has inconsistent linked-clone metadata", r.Name)
+		}
+		ep := lvols[epName]
+		if ep.DriverSpecific.Lvol.BaseSnapshot != GetReplicaSnapshotLvolName(r.cloneSourceReplicaName, r.cloneSourceSnapshotName) {
+			return fmt.Errorf("replica %s clone entrypoint needs source repair", r.Name)
+		}
+	} else if r.ActiveChain[0] != nil && IsCloneEntrypointLvol(r.ActiveChain[0].Name) {
+		return fmt.Errorf("replica %s has unrecorded linked-clone ancestry", r.Name)
+	}
+	for name, info := range r.cloneEntrypointMap {
+		ep := lvols[name]
+		if info == nil || info.LvolName != name || info.SnapshotName == "" ||
+			name != GetCloneEntrypointLvolName(r.Name, info.SnapshotName) ||
+			info.SnapshotLvolName != GetReplicaSnapshotLvolName(r.Name, info.SnapshotName) ||
+			ep == nil || ep.DriverSpecific == nil || ep.DriverSpecific.Lvol == nil || !ep.DriverSpecific.Lvol.Snapshot ||
+			ep.DriverSpecific.Lvol.BaseSnapshot != info.SnapshotLvolName {
+			return fmt.Errorf("source replica %s entrypoint %s needs repair", r.Name, name)
+		}
+		if _, err := getExpansionLvolAncestry(name, lvols); err != nil {
+			return err
+		}
+		for clone := range info.CloneReplicas {
+			chain, err := getExpansionLvolAncestry(clone, lvols)
+			if err != nil {
+				return fmt.Errorf("source replica %s clone %s ancestry: %w", r.Name, clone, err)
+			}
+			if !slices.Contains(chain, name) {
+				return fmt.Errorf("source replica %s clone %s no longer references %s", r.Name, clone, name)
+			}
+		}
+	}
+	return nil
+}
+
+// Both the read-only RPC phase and the actual resize call this under r.Lock.
+// Other replicas' ancestor operations are not globally locked. SPDK serializes
+// head metadata operations; this path never mutates their parents/entrypoints.
+func (r *Replica) precheckExpansionNoLock(ctx context.Context, spdkClient *spdkclient.Client, size uint64) error {
+	if err := r.validateExpansionEligibilityNoLock(); err != nil {
+		return err
+	}
+	coordinated := hasExpansionPhase(ctx, "replica-precheck") || hasExpansionPhase(ctx, "backend-masked")
+	if coordinated && !r.IsExposed {
+		return fmt.Errorf("live replica expansion requires an exported head")
+	}
 	clusterSize, err := r.fetchClusterSize(spdkClient)
 	if err != nil {
-		return errors.Wrapf(err, "failed to fetch cluster size for replica %v", r.Name)
+		return err
 	}
+	if size < r.SpecSize || size == 0 || clusterSize == 0 || util.RoundUp(size, clusterSize) != size {
+		return fmt.Errorf("invalid replica expansion size %d (current %d)", size, r.SpecSize)
+	}
+	lvols, err := r.getExpansionLvolsNoLock(ctx)
+	if err != nil {
+		return err
+	}
+	if err := r.validateExpansionTopologyNoLock(lvols); err != nil {
+		return err
+	}
+	head := lvols[r.Name]
+	actual := head.NumBlocks * uint64(head.BlockSize)
+	if head.BlockSize == 0 || actual < r.SpecSize || actual > size {
+		return fmt.Errorf("replica %s actual head size %d outside [%d,%d]", r.Name, actual, r.SpecSize, size)
+	}
+	// Uncoordinated expansion is used before rebuild attachment. It may not
+	// resize a connected replica; coordinated live expansion has one consumer.
+	if r.IsExposed {
+		var controllers []json.RawMessage
+		if err := expansionRPC(ctx, "nvmf_subsystem_get_controllers", map[string]any{"nqn": helpertypes.GetNQN(r.Name)}, &controllers); err != nil {
+			return err
+		}
+		if err := validateExpansionConsumerCount(len(controllers), coordinated); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	roundedSize := util.RoundUp(size, clusterSize)
-	if roundedSize != size {
-		return fmt.Errorf("replica %s rounded up spec size from %v to %v since the spec size should be multiple of MiB", r.Name, size, roundedSize)
+func validateExpansionConsumerCount(count int, coordinated bool) error {
+	if coordinated && count != 1 {
+		return fmt.Errorf("live resize requires exactly one backend consumer, found %d", count)
 	}
+	if !coordinated && count != 0 {
+		return fmt.Errorf("uncoordinated resize requires a disconnected replica, found %d consumers", count)
+	}
+	return nil
+}
 
-	if r.SpecSize > size {
-		return fmt.Errorf("cannot expand replica %s to a smaller size %v, current spec size %v", r.Name, size, r.SpecSize)
+func (r *Replica) Expand(ctx context.Context, spdkClient *spdkclient.Client, size uint64) error {
+	ctx, cancel := context.WithTimeout(ctx, expansionTimeout)
+	defer cancel()
+	r.Lock()
+	defer r.Unlock()
+	phase, err := expansionPhase(ctx)
+	if err != nil {
+		return err
 	}
-	if r.SpecSize == size {
-		r.log.Infof("Replica %s had been expanded to size %v", r.Name, size)
+	if phase == "" {
+		return r.expandDisconnectedNoLock(ctx, spdkClient, size)
+	}
+	if phase != "backend-masked" {
+		return fmt.Errorf("live replica resize requires namespace notices masked")
+	}
+	if err := r.precheckExpansionNoLock(ctx, spdkClient, size); err != nil {
+		return err
+	}
+	actual, err := expansionBdevCapacity(ctx, r.Alias)
+	if err != nil {
+		return err
+	}
+	if actual > size {
+		return fmt.Errorf("refusing to shrink already grown lvol %s from %d to %d", r.Alias, actual, size)
+	}
+	if actual != size {
+		var resized bool
+		resizeErr := expansionRPC(ctx, "bdev_lvol_resize", map[string]any{"name": r.Alias, "size_in_mib": util.BytesToMiB(size)}, &resized)
+		if err := waitExpansionBdevCapacity(ctx, r.Alias, size); err != nil {
+			return errors.Join(resizeErr, err)
+		}
+	}
+	// Validate lineage again before replacing the head cache or advertising size.
+	// A failed postcheck leaves any physical growth intact for monotonic retry.
+	lvols, err := r.getExpansionLvolsNoLock(ctx)
+	if err != nil {
+		return err
+	}
+	if err := r.validateExpansionTopologyNoLock(lvols); err != nil {
+		return err
+	}
+	if err := r.updateHeadCache(spdkClient); err != nil {
+		return err
+	}
+	r.SpecSize = size
+	r.log.Infof("live-export replica %s reached %d without stopping exposure", r.Name, size)
+	return nil
+}
+
+// Caller holds r.Lock. Rebuild preparation grows an unconnected destination
+// before its active chain is complete, so live lineage preflight cannot be used.
+// This explicit offline workflow must never resize an attached backend.
+func (r *Replica) expandDisconnectedNoLock(ctx context.Context, spdkClient *spdkclient.Client, size uint64) error {
+	if r.isRestoring || r.isSnapshotCloning || len(r.snapshotCloningSrcCache) != 0 || r.rebuildingSrcCache.dstReplicaName != "" {
+		return fmt.Errorf("disconnected expansion conflicts with an active source, restore, or clone operation")
+	}
+	clusterSize, err := r.fetchClusterSize(spdkClient)
+	if err != nil {
+		return err
+	}
+	if size != util.RoundUp(size, clusterSize) || size < r.SpecSize {
+		return fmt.Errorf("invalid disconnected replica expansion goal %d", size)
+	}
+	if size == r.SpecSize {
 		return nil
 	}
-
-	// If the bdev is exposed, we must stop exposing it before the resize.
-	reExposeBdev := false
-	if r.IsExposed {
-		if err := spdkClient.StopExposeBdev(helpertypes.GetNQN(r.Name)); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return errors.Wrapf(err, "failed to stop expose replica %v before expansion", r.Name)
+	if r.Head == nil {
+		return fmt.Errorf("disconnected expansion requires an existing head")
+	}
+	// Query actual exports even when the in-memory flag says unexposed.
+	var subsystems []spdktypes.NvmfSubsystem
+	if err := expansionRPC(ctx, "nvmf_get_subsystems", map[string]any{}, &subsystems); err != nil {
+		return err
+	}
+	nqn := helpertypes.GetNQN(r.Name)
+	for _, subsystem := range subsystems {
+		if subsystem.Nqn != nqn {
+			continue
+		}
+		var controllers []json.RawMessage
+		if err := expansionRPC(ctx, "nvmf_subsystem_get_controllers", map[string]any{"nqn": nqn}, &controllers); err != nil {
+			return err
+		}
+		if err := validateExpansionConsumerCount(len(controllers), false); err != nil {
+			return err
+		}
+	}
+	reExpose := r.IsExposed
+	if reExpose {
+		if err := spdkClient.StopExposeBdev(nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+			return err
 		}
 		r.IsExposed = false
-		reExposeBdev = true
 	}
-
-	resized, err := spdkClient.BdevLvolResize(r.Alias, util.BytesToMiB(size))
-	if !resized || err != nil {
-		r.log.Warn("Failed to expand replica or returned false; verifying lvol size")
-
-		// Some replicas may have returned an error during expansion due to unexpected issues
-		// (e.g. temporary network glitch, internal error, timeout).
-		// To avoid mistakenly marking those as failed, we perform a single follow-up check
-		// to verify if the replica was actually expanded.
-
-		headBdevLvol, getLvolErr := spdkClient.BdevLvolGetByName(r.Alias, 0)
-		if getLvolErr != nil {
-			return errors.Wrapf(err, "failed to get bdev lvol: %v", getLvolErr)
-		}
-		lvol := BdevLvolInfoToServiceLvol(&headBdevLvol)
-		if lvol.SpecSize != size {
-			if err != nil {
-				return errors.Wrapf(err, "bdev lvol resize error")
-			}
-
-			if !resized {
-				return fmt.Errorf("no error, but replica %s not resized", r.Name)
-			}
-		}
-
-		r.log.Info("Replica expansion succeeded despite earlier error")
+	actual, err := expansionBdevCapacity(ctx, r.Alias)
+	if err != nil {
+		return err
 	}
-
-	// If we had previously exposed the bdev, we must re-expose it after the resize.
-	if reExposeBdev {
-		if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)),
-			helpertypes.InternalHostNQN); err != nil {
-			return errors.Wrapf(err, "failed to start expose replica %v after expansion", r.Name)
+	if actual > size {
+		return fmt.Errorf("refusing to shrink already grown replica from %d to %d", actual, size)
+	}
+	if actual < size {
+		var resized bool
+		resizeErr := expansionRPC(ctx, "bdev_lvol_resize", map[string]any{"name": r.Alias, "size_in_mib": util.BytesToMiB(size)}, &resized)
+		if err := waitExpansionBdevCapacity(ctx, r.Alias, size); err != nil {
+			return errors.Join(resizeErr, err)
+		}
+	}
+	if reExpose {
+		if err := spdkClient.StartExposeBdev(nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), helpertypes.InternalHostNQN); err != nil {
+			return err
 		}
 		r.IsExposed = true
 	}
-
-	// Blindly clean up then update the caches for the head
 	r.Head = nil
-	if len(r.ActiveChain) > 0 &&
-		r.ActiveChain[len(r.ActiveChain)-1] != nil &&
-		r.ActiveChain[len(r.ActiveChain)-1].Name == r.Name {
-		r.ActiveChain = r.ActiveChain[:len(r.ActiveChain)-1]
-	}
-
+	r.removeHeadFromActiveChainIfExists()
 	if err := r.updateHeadCache(spdkClient); err != nil {
-		return errors.Wrapf(err, "failed to update head cache for replica %v", r.Name)
+		return err
 	}
-
-	r.log.Info("Expanding replica complete")
 	r.SpecSize = size
 	return nil
 }
@@ -2479,7 +2710,7 @@ func (r *Replica) SnapshotCloneDstStart(spdkClient *spdkclient.Client, snapshotN
 		}()
 
 		// Always notify the src replica to clear its snapshotCloningSrcCache
-		// entry — on success as completion, on failure as cleanup.
+		// entry -- on success as completion, on failure as cleanup.
 		defer func() {
 			if cleanupErr := srcReplicaServiceCli.ReplicaSnapshotCloneSrcFinish(
 				r.snapshotCloningDstCache.srcReplicaName, r.Name); cleanupErr != nil {
@@ -2889,7 +3120,7 @@ func (r *Replica) snapshotLinkedCloneSrcStart(spdkClient *spdkclient.Client, sna
 		epAlias := spdktypes.GetLvolAlias(r.LvsName, epLvolName)
 		epBdev, err := spdkClient.BdevLvolGetByName(epAlias, 0)
 		if err != nil {
-			// Entrypoint is in the map but missing from SPDK — stale map entry; recreate.
+			// Entrypoint is in the map but missing from SPDK -- stale map entry; recreate.
 			r.log.WithError(err).Warnf("Clone entrypoint %s is in map but not found in SPDK; removing stale entry and recreating", epLvolName)
 			delete(r.cloneEntrypointMap, epLvolName)
 			epInfo = nil
@@ -2975,7 +3206,7 @@ func createCloneEntrypointLvol(spdkClient *spdkclient.Client, log *safelog.SafeL
 	}
 
 	// Step 2: Snapshot the tmp head to create the read-only entrypoint.
-	// After this: srcSnapshot → entrypoint(read-only) → tmpHead(writable, child of entrypoint)
+	// After this: srcSnapshot -> entrypoint(read-only) -> tmpHead(writable, child of entrypoint)
 	epUUID, err := spdkClient.BdevLvolSnapshot(tmpHeadUUID, epLvolName, []spdkclient.Xattr{})
 	if err != nil {
 		if _, delErr := spdkClient.BdevLvolDelete(tmpHeadAlias); delErr != nil {
@@ -3876,7 +4107,7 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	dstHeadLvolAddress := net.JoinHostPort(r.IP, strconv.Itoa(int(r.PortStart)))
 
 	// Snapshots may be deleted below hence this cache will become stale.
-	// On success, RebuildingDstFinish→construct() clears this flag.
+	// On success, RebuildingDstFinish->construct() clears this flag.
 	r.reconstructRequired = true
 
 	// Delete extra snapshots if any
@@ -4692,7 +4923,7 @@ func (r *Replica) RebuildingDstSnapshotCreate(spdkClient *spdkclient.Client, sna
 	}
 	// Guarantee the snapshot lvol has the correct parent after rebuilding.
 	// The ancestor snapshot's parent is a clone entrypoint for linked-clone replicas; however the
-	// entrypoint does not exist on DST at this point — it will be set in RebuildingDstFinish.
+	// entrypoint does not exist on DST at this point -- it will be set in RebuildingDstFinish.
 	// Treat it the same as an empty parent here so we do not accidentally call BdevLvolDetachParent.
 	dstSnapParentLvolName := ""
 	if srcSnapSvcLvol.Parent == "" || IsCloneEntrypointLvol(srcSnapSvcLvol.Parent) {

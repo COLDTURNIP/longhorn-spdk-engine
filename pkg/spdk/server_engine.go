@@ -133,19 +133,12 @@ func (s *Server) EngineExpand(ctx context.Context, req *spdkrpc.EngineExpandRequ
 		return nil, grpcstatus.Errorf(grpccodes.Unimplemented, "cannot expand ublk frontend engine %v", req.Name)
 	}
 
-	// EC volumes take the backend-reset path because ShardGroupExpand has
-	// already driven the backend resize against the ShardGroup process;
-	// RAID1 keeps its tear-down/expand-replicas/reconstruct cycle. The
-	// engine itself remains layout-blind - the dispatch is decided here
-	// by inspecting which Backend implementation EngineCreate's factory
-	// populated. EngineExpandRequest does not currently carry
-	// DataLayoutType, so this inference is the substitute for
-	// req.data_layout_type until both topologies converge on
-	// ExpandViaBackendReset and the dispatch is removed.
+	// Shard groups resize their heads before this RPC; preserve their existing
+	// backend-refresh path. RAID1 coordinates live replica growth here.
 	if isShardedEngine(e) {
 		err = e.ExpandViaBackendReset(spdkClient, req.Size)
 	} else {
-		err = e.Expand(spdkClient, req.Size)
+		err = e.Expand(ctx, req.Size)
 	}
 	if err != nil {
 		return nil, toExpansionGRPCError(err, "failed to expand engine %v", req.Name)
@@ -154,13 +147,8 @@ func (s *Server) EngineExpand(ctx context.Context, req *spdkrpc.EngineExpandRequ
 	return &emptypb.Empty{}, nil
 }
 
-// isShardedEngine reports whether the engine's backends are
-// shardGroupBackend (EC layout). This is the only place server_engine.go
-// peers into Backend concrete types, and it does so to preserve the
-// "engine.go knows no layout" invariant: the layout is read from what
-// EngineCreate's factory already populated, not from a layout field on
-// Engine. This dispatch site is expected to be removed once
-// Engine.ExpandViaBackendReset covers both layouts.
+// isShardedEngine distinguishes the existing shard-group refresh workflow from
+// RAID1's coordinated live replica resize using the backends populated at creation.
 func isShardedEngine(e *Engine) bool {
 	e.RLock()
 	defer e.RUnlock()

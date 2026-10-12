@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
@@ -75,7 +76,7 @@ func (c *SPDKClient) ReplicaGet(name string) (*api.Replica, error) {
 	return api.ProtoReplicaToReplica(resp), nil
 }
 
-// ReplicaExpand requests an online expansion of the specified replica.
+// ReplicaExpand grows an idle, disconnected replica before backend attachment.
 func (c *SPDKClient) ReplicaExpand(name string, size uint64) error {
 	if name == "" {
 		return fmt.Errorf("failed to expand replica: missing required parameter")
@@ -90,6 +91,28 @@ func (c *SPDKClient) ReplicaExpand(name string, size uint64) error {
 		Size: size,
 	})
 	return errors.Wrapf(err, "failed to expand replica %v", name)
+}
+
+// ReplicaExpandPrecheck verifies eligibility without resizing or changing topology.
+// The actual resize rechecks the same conditions under the replica lock.
+func (c *SPDKClient) ReplicaExpandPrecheck(ctx context.Context, name string, size uint64) error {
+	return c.replicaExpandWithPhase(ctx, name, size, "replica-precheck")
+}
+
+// ReplicaExpandWithNoticeMasked grows the head while its sole backend has namespace notices masked.
+func (c *SPDKClient) ReplicaExpandWithNoticeMasked(ctx context.Context, name string, size uint64) error {
+	return c.replicaExpandWithPhase(ctx, name, size, "backend-masked")
+}
+
+func (c *SPDKClient) replicaExpandWithPhase(ctx context.Context, name string, size uint64, phase string) error {
+	if name == "" {
+		return fmt.Errorf("failed to expand replica: missing required parameter")
+	}
+	ctx, cancel := context.WithTimeout(ctx, GRPCServiceTimeout)
+	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, ExpansionPhaseMetadataKey, phase)
+	_, err := c.getSPDKServiceClient().ReplicaExpand(ctx, &spdkrpc.ReplicaExpandRequest{Name: name, Size: size})
+	return errors.Wrapf(err, "failed to expand replica %v in phase %s", name, phase)
 }
 
 // ReplicaList returns all replicas known to the SPDK service.
