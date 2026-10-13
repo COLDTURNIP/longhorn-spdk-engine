@@ -121,7 +121,18 @@ func (s *Server) ReplicaExpand(ctx context.Context, req *spdkrpc.ReplicaExpandRe
 		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find replica %v", req.Name)
 	}
 
-	if err := r.Expand(spdkClient, req.Size); err != nil {
+	phase, err := expansionPhase(ctx)
+	if err != nil || (phase != "" && phase != "replica-precheck" && phase != "backend-masked") {
+		return nil, grpcstatus.Error(grpccodes.FailedPrecondition, "replica expansion requires a single precheck or notice-masked phase")
+	}
+	precheck := phase == "replica-precheck"
+	if precheck {
+		r.Lock()
+		defer r.Unlock()
+		if err := r.precheckExpansionNoLock(ctx, spdkClient, req.Size); err != nil {
+			return nil, err
+		}
+	} else if err := r.Expand(ctx, spdkClient, req.Size); err != nil {
 		return nil, err
 	}
 

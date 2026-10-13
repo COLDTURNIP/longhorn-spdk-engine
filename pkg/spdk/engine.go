@@ -3,7 +3,9 @@ package spdk
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,9 +17,6 @@ import (
 	retrygo "github.com/avast/retry-go/v5"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
-
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/retry"
 
 	"github.com/longhorn/backupstore"
 	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
@@ -153,6 +152,8 @@ type Engine struct {
 	isExpanding           bool
 	lastExpansionFailedAt string
 	lastExpansionError    string
+	pendingExpansionSize  uint64            // In-memory goal retained after partial growth.
+	expansionFeatures     map[string]uint32 // Original backend AEC values retained for retry.
 
 	isCloning bool // true while SnapshotClone is in progress (linked-clone mode only)
 
@@ -419,22 +420,12 @@ func (e *Engine) SetTargetListenerANAState(spdkClient *spdkclient.Client, anaSta
 		return err
 	}
 
-	// Hold the write lock for the entire RPC + state update.
-	//
-	// Expand also holds the write lock while it tears down and re-creates the
-	// NVMe-TCP subsystem. Because the subsystem keeps the same stable NQN,
-	// IP, and port across an Expand, a check-after-RPC pattern cannot detect
-	// whether the subsystem was recycled. Without the write lock the SPDK RPC
-	// could land on the newly recreated subsystem and silently overwrite the
-	// ANA state that Expand carefully preserved.
-	//
-	// This is safe because:
-	//  - NvmfSubsystemListenerSetANAState is a fast SPDK RPC (flips an
-	//    internal flag, no I/O involved).
-	//  - SetTargetListenerANAState is only called during switchover, so
-	//    contention with Expand is rare.
-	//  - The SPDK RPC does not call back into Engine, so there is no
-	//    deadlock risk.
+	// Hold the engine write lock across the SPDK RPC and cached ANA state update.
+	// Expansion holds the same lock from its optimized-target precheck through
+	// backend growth and capacity verification, so an ANA transition cannot
+	// interleave with that sequence. Although live expansion preserves the
+	// subsystem, it must still serialize with target switchover.
+	// The SPDK listener RPC does not call back into Engine.
 	e.Lock()
 	defer e.Unlock()
 
@@ -2874,115 +2865,164 @@ func (e *Engine) RestoreStatus() (*spdkrpc.RestoreStatusResponse, error) {
 	return resp, nil
 }
 
-// Expand performs an online volume expansion for the Longhorn Engine using SPDK.
-// It expands the underlying replica logical volumes (lvol), recreates the SPDK RAID bdev,
-// suspends and resumes frontend I/O as needed, and ensures cleanup and status updates on failure.
-func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) {
-	// Add precheck
-	requireExpansion, err := e.ExpandPrecheck(spdkClient, size)
+// validateExpansionFrontendNoLock requires an idle DR engine or an optimized target.
+func (e *Engine) validateExpansionFrontendNoLock() error {
+	switch e.Frontend {
+	case types.FrontendEmpty:
+		if e.NvmeTcpTarget != nil && (e.NvmeTcpTarget.Port != 0 || e.NvmeTcpTarget.Nqn != "" || e.NvmeTcpTarget.IP != "") {
+			return fmt.Errorf("frontendless expansion requires the temporary restore target to be stopped")
+		}
+	case types.FrontendSPDKTCPBlockdev:
+		if e.NvmeTcpTarget == nil || e.NvmeTcpTarget.ANAState != NvmeTCPANAStateOptimized {
+			return fmt.Errorf("live expansion requires an optimized NVMe/TCP block-device target")
+		}
+	default:
+		return fmt.Errorf("expansion does not support frontend %q", e.Frontend)
+	}
+	return nil
+}
+
+// Caller holds the engine lock. Metadata records frontend coordination; it is
+// not an environment switch or an authorization mechanism.
+func (e *Engine) validateExpansionCoordinationNoLock(ctx context.Context) error {
+	phase := "frontend-suspended"
+	if e.Frontend == types.FrontendEmpty {
+		phase = "backend-idle"
+	}
+	actual, err := expansionPhase(ctx)
 	if err != nil {
 		return err
 	}
-
-	e.Lock()
-	originalSize := e.SpecSize
-	if !requireExpansion {
-		if e.SpecSize < size {
-			e.SpecSize = size
-		}
-		// Clear stale expansion error from a previous partial failure,
-		// since there is nothing left to expand.
-		e.lastExpansionError = ""
-		e.lastExpansionFailedAt = ""
-		e.Unlock()
-		return nil
+	if actual != phase {
+		return fmt.Errorf("expansion requires coordinated %s metadata", phase)
 	}
-	defer e.Unlock()
+	return nil
+}
+
+// Caller holds e.Lock. The pending goal records partial growth for in-process retry;
+// it is not a durable expansion journal.
+func (e *Engine) precheckExpansionNoLock(ctx context.Context, size uint64) (bool, error) {
 	if e.isExpanding {
-		return fmt.Errorf("%w", ErrExpansionInProgress)
+		return false, fmt.Errorf("%w", ErrExpansionInProgress)
+	}
+	if e.IsRestoring {
+		return false, fmt.Errorf("%w", ErrRestoringInProgress)
+	}
+	if e.isCloning || e.State != types.InstanceStateRunning {
+		return false, fmt.Errorf("expansion requires an idle, running engine")
+	}
+	if err := e.validateExpansionFrontendNoLock(); err != nil {
+		return false, err
+	}
+	if size < e.SpecSize || size == 0 || util.RoundUp(size, helpertypes.MiB) != size {
+		return false, fmt.Errorf("%w: goal %d, current %d", ErrExpansionInvalidSize, size, e.SpecSize)
+	}
+	if e.pendingExpansionSize != 0 && e.pendingExpansionSize != size {
+		return false, fmt.Errorf("retry must finish pending goal %d before changing it", e.pendingExpansionSize)
+	}
+	if _, err := e.precheckBackendExpansionNoLock(size); err != nil {
+		return false, err
+	}
+	for name, backend := range e.backends {
+		if _, ok := backend.(*replicaBackend); !ok {
+			return false, fmt.Errorf("live replica expansion does not support backend %s", name)
+		}
+	}
+	// Check every replica before frontend suspension or any backend mutation.
+	// This is an advisory read-only phase; resize revalidates under r.Lock.
+	replicas, err := e.getReplicaClients()
+	if err != nil {
+		return false, err
+	}
+	defer e.closeReplicaClients(replicas)
+	for _, name := range slices.Sorted(maps.Keys(e.backends)) {
+		if replicas[name] == nil {
+			return false, fmt.Errorf("missing replica precheck client %s", name)
+		}
+		if err := replicas[name].ReplicaExpandPrecheck(ctx, name, size); err != nil {
+			return false, fmt.Errorf("replica %s precheck failed: %w", name, err)
+		}
+	}
+	actual, err := expansionBdevCapacity(ctx, e.Name)
+	return e.SpecSize != size || actual != size || e.pendingExpansionSize != 0, err
+}
+
+func (e *Engine) Expand(ctx context.Context, size uint64) error {
+	ctx, cancel := context.WithTimeout(ctx, expansionTimeout)
+	defer cancel()
+	e.Lock()
+	defer e.Unlock()
+	if err := e.validateExpansionCoordinationNoLock(ctx); err != nil {
+		return err
+	}
+	required, err := e.precheckExpansionNoLock(ctx, size)
+	if err != nil || !required {
+		return err
 	}
 	e.isExpanding = true
-	e.lastExpansionFailedAt = ""
-	e.lastExpansionError = ""
+	e.pendingExpansionSize = size
+	defer func() { e.isExpanding = false }()
+	e.log.Infof("live-export expansion to %d: preserving exports and RAID, frontend coordination verified", size)
 
-	e.log.Info("Expanding engine frontend")
-
-	defer func() {
-		e.isExpanding = false
-		e.finishExpansion(originalSize, size, err)
-	}()
-
-	var expandErr error
-
-	replicaClients, err := e.getReplicaClients()
-	if err != nil {
-		return err
-	}
-	defer e.closeReplicaClients(replicaClients)
-
-	e.log.Infof("Stopping to expose RAID bdev for engine %s", e.Name)
-	switch e.Frontend {
-	case types.FrontendUBLK:
-		return fmt.Errorf("not support ublk frontend for expansion for engine %s", e.Name)
-	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
-		if err := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return errors.Wrapf(err, "failed to stop exposing bdev for engine %s", e.Name)
+	// A failed attempt stays running at its old advertised size. The frontend
+	// sees LastExpansionError and will not reload dm or claim completion.
+	expandErr := func() error {
+		if e.Frontend == types.FrontendEmpty {
+			if err := requireNoExpansionExport(ctx, getStableVolumeNQN(e.VolumeName), expansionRPC); err != nil {
+				return err
+			}
 		}
-	}
-
-	e.log.Infof("Tearing down RAID bdev for engine %s", e.Name)
-	raidBdevUUID, err := e.tearDownRaidBdev(spdkClient)
-	if err != nil {
-		return errors.Wrap(err, "failed to tear down expansion")
-	}
-	if e.RaidBdevUUID == "" {
-		e.RaidBdevUUID = raidBdevUUID
-	}
-
-	// Perform expansion
-	// We should always try to reconstruct the RAID bdev even if the expansion fails.
-	if err := e.expandReplicas(spdkClient, replicaClients, size); err != nil {
-		e.log.WithError(err).Errorf("Failed to expand replicas for engine %s", e.Name)
-		// If expansion failed, we should return the error to the caller,
-		// but we still need to Reconstruct the RAID bdev and Expose it
-		// to make sure volume is still usable (with old size).
-		// We will capture this error and return it at the end of the function.
-		// We don't return here because we need to reconstruct the RAID bdev.
-		// If we return here, the volume will be lost as we already tear down the RAID bdev.
-		// We will return this error after the deferred functions are executed.
-		// However, the err variable is named return variable, so we can just assign it.
-		// But we need to be careful not to overwrite it with nil if subsequent steps succeed.
-		// So we use a separate variable.
-		expandErr = err
-	}
-
-	e.log.Infof("Reconstructing RAID bdev for engine %s", e.Name)
-	if err := e.reconstructRaidBdev(spdkClient, e.RaidBdevUUID); err != nil {
-		return errors.Wrap(err, "failed to reconstruct RAID bdev")
-	}
-
-	switch e.Frontend {
-	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
-		cntlid := getTargetCntlid(e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port)
-		// Preserve the current ANA state across the expand. If this engine
-		// was demoted to inaccessible during a switchover, re-exposing with
-		// optimized would create a dual-write window.
-		currentANAState := e.NvmeTcpTarget.ANAState
-		if currentANAState == "" {
-			currentANAState = NvmeTCPANAStateOptimized
+		for _, name := range slices.Sorted(maps.Keys(e.backends)) {
+			if err := flushExpansionBackend(ctx, name, expansionRPC); err != nil {
+				return err
+			}
 		}
-		spdkANAState, err := toSPDKListenerANAState(currentANAState)
+		replicas, err := e.getReplicaClients()
 		if err != nil {
-			return errors.Wrapf(err, "invalid ANA state %q for engine target %v during expand", currentANAState, e.Name)
+			return err
 		}
-		if err := e.startExposeNVMeTCPTarget(spdkClient, currentANAState, spdkANAState, cntlid); err != nil {
-			return errors.Wrapf(err, "failed to start exposing RAID bdev for engine target %v", e.Name)
-		}
-	case types.FrontendEmpty:
-		e.log.Infof("Skipping RAID bdev exposure for engine %s after expansion because frontend is empty", e.Name)
-	}
+		defer e.closeReplicaClients(replicas)
+		for _, name := range slices.Sorted(maps.Keys(e.backends)) {
+			backend := e.backends[name]
+			replicaClient := replicas[name]
+			if replicaClient == nil {
+				return fmt.Errorf("missing replica client %s", name)
+			}
+			knownOriginal, hasKnownOriginal := e.expansionFeatures[name]
+			original, captured, err := resizeWithBackendRefreshKnown(ctx, name, knownOriginal, hasKnownOriginal, func() error {
+				return replicaClient.ReplicaExpandWithNoticeMasked(ctx, name, size)
+			}, expansionRPC)
+			if captured {
+				if e.expansionFeatures == nil {
+					e.expansionFeatures = map[string]uint32{}
+				}
+				e.expansionFeatures[name] = original
+			}
+			if err != nil {
+				return err
+			}
+			if err := waitExpansionBdevCapacity(ctx, backend.BdevName(), size); err != nil {
+				return err
+			}
+			e.log.Infof("live-export replica %s reached %d; backend reset complete and notices restored", name, size)
 
-	return expandErr
+		}
+		return waitExpansionBdevCapacity(ctx, e.Name, size)
+	}()
+	if expandErr != nil {
+		e.lastExpansionError = expandErr.Error()
+		e.lastExpansionFailedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		e.log.WithError(expandErr).Warn("live-export expansion incomplete; keeping old size for retry, never shrinking")
+		return nil
+	}
+	e.SpecSize = size
+	e.pendingExpansionSize = 0
+	clear(e.expansionFeatures)
+	e.expansionFeatures = nil
+	e.lastExpansionError = ""
+	e.lastExpansionFailedAt = ""
+	e.log.Infof("live-export engine %s reached %d without export or RAID recreation", e.Name, size)
+	return nil
 }
 
 // ExpandViaBackendReset expands the engine by resetting each backend
@@ -2997,14 +3037,10 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 // resize hang on the engine's own bdev_nvme initiator), which severs the
 // AER that would otherwise carry the size change to this initiator. The
 // explicit controller reset is the compensation.
-//
-// This is the path used for EC volumes: ShardGroupController already drove
-// ShardExpand + ShardGroupExpand against the ShardGroup process, so by the
-// time EngineExpand arrives the backend lvol has been resized. RAID1 still
-// uses the tear-down/expand-replicas/reconstruct cycle in Engine.Expand;
-// both layouts are expected to converge on this method once the
-// reset-refresh path is verified reliable on the SPDK build the branch
-// ships against.
+// ShardGroup.Expand resizes its head in another process before this engine RPC.
+// The controller reset refreshes that already-grown capacity without rebuilding
+// the engine's RAID or export. RAID1 instead coordinates writable replica heads
+// and AEC restoration in Engine.Expand.
 func (e *Engine) ExpandViaBackendReset(spdkClient *spdkclient.Client, size uint64) (err error) {
 	const (
 		pollInterval = 500 * time.Millisecond
@@ -3118,108 +3154,6 @@ func (e *Engine) finishExpansion(fromSize, toSize uint64, err error) {
 	e.log.Infof("Succeeded to expand from size %v to %v", fromSize, toSize)
 }
 
-func (e *Engine) tearDownRaidBdev(spdkClient *spdkclient.Client) (bdevUUID string, err error) {
-	bdevRaid, err := spdkClient.BdevRaidGet(e.Name, 0)
-	if err != nil {
-		if jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			// RAID bdev does not exist, do nothing
-			return "", nil
-		}
-		return "", errors.Wrapf(err, "failed to get RAID bdev %s", e.Name)
-	}
-	if len(bdevRaid) == 0 {
-		// RAID already deleted, do nothing
-		return "", nil
-	}
-
-	bdevUUID = bdevRaid[0].UUID
-
-	deleted, err := spdkClient.BdevRaidDelete(e.Name)
-	if err != nil {
-		if jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			e.log.WithField("engineName", e.Name).Info("RAID bdev already deleted")
-			return bdevUUID, nil
-		}
-		return bdevUUID, err
-	}
-
-	if deleted {
-		return bdevUUID, nil
-	}
-
-	return bdevUUID, fmt.Errorf("failed to delete RAID bdev %s", e.Name)
-}
-
-func (e *Engine) expandReplicas(spdkClient *spdkclient.Client, replicaClients map[string]*client.SPDKClient, size uint64) error {
-	e.log.Info("Expanding replicas")
-
-	var (
-		wg     sync.WaitGroup
-		mu     sync.Mutex
-		failed = make(map[string]error)
-	)
-
-	recordFailure := func(replicaName string, err error) {
-		if err == nil {
-			return
-		}
-		mu.Lock()
-		failed[replicaName] = err
-		mu.Unlock()
-	}
-
-	for replicaName, replicaClient := range replicaClients {
-		replicaName, replicaClient := replicaName, replicaClient
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					recordFailure(replicaName, fmt.Errorf("panic during replica expansion: %v", r))
-					e.log.WithField("replica", replicaName).Errorf("Panic during replica expansion: %v", r)
-				}
-			}()
-
-			if err := e.expandSingleReplica(spdkClient, replicaName, replicaClient, size); err != nil {
-				recordFailure(replicaName, err)
-			}
-		}()
-	}
-
-	wg.Wait()
-
-	return e.handleReplicaExpandResult(replicaClients, failed)
-}
-
-func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName string, replicaClient *client.SPDKClient, size uint64) error {
-	replicaStatus, ok := e.backends[replicaName]
-	if !ok {
-		e.log.WithField("replica", replicaName).Warn("Replica not found in status map")
-		return nil
-	}
-
-	replica, err := replicaClient.ReplicaGet(replicaName)
-	if err != nil {
-		return errors.Wrap(err, "get replica failure")
-	}
-
-	if replica.SpecSize == size {
-		return nil
-	}
-
-	if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName(), disconnectMaxRetries, disconnectRetryInterval); err != nil {
-		return err
-	}
-
-	if err := replicaClient.ReplicaExpand(replicaName, size); err != nil {
-		return err
-	}
-
-	_, err = connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
-	return err
-}
-
 func (e *Engine) handleReplicaExpandResult(replicaClients map[string]*client.SPDKClient, failed map[string]error) error {
 	if len(failed) == 0 {
 		e.log.Info("All replicas expand success")
@@ -3257,115 +3191,70 @@ func (e *Engine) markReplicasERR(failed map[string]error) {
 	}
 }
 
-func (e *Engine) reconstructRaidBdev(spdkClient *spdkclient.Client, bdevRaidUUID string) (err error) {
-	e.log.WithFields(logrus.Fields{
-		"engineName": e.Name,
-		"volumeName": e.VolumeName,
-		"frontend":   e.Frontend,
-	}).Info("Reconstructing RAID bdev")
-
-	// create the same name of raid bdev
-	replicaBdevList := []string{}
-	for _, replicaStatus := range e.backends {
-		if replicaStatus.Mode() != types.ModeRW {
-			continue
-		}
-		if replicaStatus.BdevName() == "" {
-			continue
-		}
-		replicaBdevList = append(replicaBdevList, replicaStatus.BdevName())
-	}
-	if len(replicaBdevList) == 0 {
-		return fmt.Errorf("no healthy replica bdevs available for RAID creation")
-	}
-
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID); err != nil {
-		return err
-	}
-
-	// wait the raid bdev is created
-	backoff := wait.Backoff{
-		Steps:    10,
-		Duration: time.Second,
-		Factor:   1.5,
-		Jitter:   0.1,
-		Cap:      time.Second * 10,
-	}
-
-	if err := retry.RetryOnConflict(backoff, func() error {
-		_, err := spdkClient.BdevRaidGet(e.Name, 0)
-		return err
-	}); err != nil {
-		return err
-	}
-
-	return nil
+// ExpandPrecheck validates the engine and all replica heads before frontend disruption.
+func (e *Engine) ExpandPrecheck(_ *spdkclient.Client, size uint64) (bool, error) {
+	return e.expandPrecheck(context.Background(), size)
 }
 
-func (e *Engine) ExpandPrecheck(spdkClient *spdkclient.Client, size uint64) (requireExpansion bool, err error) {
+// The RPC entry point retains the caller's deadline/cancellation; the public
+// helper above keeps compatibility for callers without a request context.
+func (e *Engine) expandPrecheck(ctx context.Context, size uint64) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, expansionTimeout)
+	defer cancel()
 	e.Lock()
 	defer e.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	// Shard groups are expanded by their controller before the engine refresh.
+	// Their existing size/mode precheck does not use replica-head RPCs.
+	for _, backend := range e.backends {
+		if _, ok := backend.(*shardGroupBackend); ok {
+			return e.precheckBackendExpansionNoLock(size)
+		}
+	}
+	return e.precheckExpansionNoLock(ctx, size)
+}
 
-	e.log.Info("Prechecking engine expansion")
-
+// Caller holds e.Lock. Mixed backend sizes are valid only for a recorded partial
+// expansion; each size must remain within the old advertised size and pending goal.
+func (e *Engine) precheckBackendExpansionNoLock(size uint64) (bool, error) {
 	if e.isExpanding {
 		return false, fmt.Errorf("%w", ErrExpansionInProgress)
 	}
-
 	if e.IsRestoring {
 		return false, fmt.Errorf("%w", ErrRestoringInProgress)
 	}
-
 	if e.isCloning {
 		return false, fmt.Errorf("engine %s linked-clone is in progress", e.Name)
 	}
-
-	defer func() {
-		if err != nil {
-			e.log.WithError(err).Error("Engine precheck expansion failed")
-		} else {
-			e.log.Infof("Engine precheck expansion result: requireExpansion=%v", requireExpansion)
-		}
-	}()
-
-	// Ensure all replicas are in RW mode and have the same size
+	if e.pendingExpansionSize != 0 && e.pendingExpansionSize != size {
+		return false, fmt.Errorf("retry must finish pending goal %d before changing it", e.pendingExpansionSize)
+	}
 	if len(e.backends) == 0 {
 		return false, fmt.Errorf("cannot expand engine with no replica")
 	}
-
-	currentReplicaSize := uint64(0)
-	for replicaName, replicaStatus := range e.backends {
-		e.log.Infof("Checking replica %s status", replicaName)
-		if replicaStatus.Mode() != types.ModeRW {
-			return false, fmt.Errorf("cannot expand engine with replica %s in mode %v", replicaName, replicaStatus.Mode())
+	currentSize := uint64(0)
+	for name, backend := range e.backends {
+		if backend.Mode() != types.ModeRW {
+			return false, fmt.Errorf("cannot expand engine with replica %s in mode %v", name, backend.Mode())
 		}
-
-		view, err := replicaStatus.Get()
+		view, err := backend.Get()
 		if err != nil {
-			return false, errors.Wrapf(err, "cannot get backend %s before expansion", replicaName)
+			return false, errors.Wrapf(err, "cannot get backend %s before expansion", name)
 		}
-
-		if currentReplicaSize == 0 {
-			currentReplicaSize = view.SpecSize
-			continue
+		if view.SpecSize > size {
+			return false, fmt.Errorf("%w: backend %s size %d exceeds goal %d", ErrExpansionInvalidSize, name, view.SpecSize, size)
 		}
-
-		if currentReplicaSize != view.SpecSize {
-			return false, fmt.Errorf("cannot expand engine with replicas in different sizes: replica %s has size %v while other replicas have size %v",
-				replicaName, view.SpecSize, currentReplicaSize)
+		if view.SpecSize < e.SpecSize {
+			return false, fmt.Errorf("backend %s size %d is below advertised engine size %d", name, view.SpecSize, e.SpecSize)
 		}
+		if currentSize != 0 && currentSize != view.SpecSize && e.pendingExpansionSize == 0 {
+			return false, fmt.Errorf("cannot expand engine with replicas in different sizes: replica %s has size %d, another has size %d", name, view.SpecSize, currentSize)
+		}
+		currentSize = view.SpecSize
 	}
-
-	if currentReplicaSize > size {
-		return false, fmt.Errorf("%w: cannot expand engine to a smaller size %v, current replica size %v",
-			ErrExpansionInvalidSize, size, currentReplicaSize)
-	}
-	if currentReplicaSize == size {
-		e.log.Infof("Replicas already at requested size %v, skipping expansion", size)
-		return false, nil // no need to expand
-	}
-
-	return true, nil
+	return currentSize != size || e.pendingExpansionSize != 0, nil
 }
 
 func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
@@ -3471,6 +3360,9 @@ func (e *Engine) getRaidBdevNoLock(bdevMap map[string]*spdktypes.BdevInfo) (*spd
 
 func (e *Engine) validateAndMaybeAdjustSpecSizeNoLock(bdevRaid *spdktypes.BdevInfo) error {
 	bdevRaidSize := bdevRaid.NumBlocks * uint64(bdevRaid.BlockSize)
+	if e.pendingExpansionSize != 0 && bdevRaidSize >= e.SpecSize && bdevRaidSize <= e.pendingExpansionSize {
+		return nil
+	}
 
 	if e.SpecSize > bdevRaidSize {
 		// not directly return error
@@ -3858,6 +3750,9 @@ func (e *Engine) ensureRebuildingReplicaSize(dstReplicaServiceCli *client.SPDKCl
 
 func validateReplicaBdevSize(e *Engine, replicaName string, bdev *spdktypes.BdevInfo) error {
 	bdevSpecSize := bdev.NumBlocks * uint64(bdev.BlockSize)
+	if e.pendingExpansionSize != 0 && bdevSpecSize >= e.SpecSize && bdevSpecSize <= e.pendingExpansionSize {
+		return nil
+	}
 	if e.SpecSize != bdevSpecSize {
 		return fmt.Errorf(
 			"found mismatching between replica bdev %s spec size %d and the engine %s spec size %d during replica %s mode validation",
