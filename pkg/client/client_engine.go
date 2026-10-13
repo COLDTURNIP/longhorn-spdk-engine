@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
@@ -189,6 +190,7 @@ func (c *SPDKClient) EngineExpand(ctx context.Context, name string, size uint64)
 	client := c.getSPDKServiceClient()
 	ctx, cancel := context.WithTimeout(ctx, GRPCServiceTimeout)
 	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, ExpansionPhaseMetadataKey, "frontend-suspended")
 
 	_, err := client.EngineExpand(ctx, &spdkrpc.EngineExpandRequest{
 		Name: name,
@@ -198,6 +200,19 @@ func (c *SPDKClient) EngineExpand(ctx context.Context, name string, size uint64)
 		return errors.Wrapf(err, "failed to expand engine %v", name)
 	}
 	return nil
+}
+
+// EngineExpandIdle expands a frontendless engine with no temporary restore initiator.
+// The engine also verifies that its restore export has been removed.
+func (c *SPDKClient) EngineExpandIdle(ctx context.Context, name string, size uint64) error {
+	if name == "" {
+		return fmt.Errorf("failed to expand idle engine: missing required parameter")
+	}
+	ctx, cancel := context.WithTimeout(ctx, GRPCServiceTimeout)
+	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, ExpansionPhaseMetadataKey, "backend-idle")
+	_, err := c.getSPDKServiceClient().EngineExpand(ctx, &spdkrpc.EngineExpandRequest{Name: name, Size: size})
+	return errors.Wrapf(err, "failed to expand idle engine %v", name)
 }
 
 // EngineExpandPrecheck validates whether the specified engine can be expanded to the requested size.

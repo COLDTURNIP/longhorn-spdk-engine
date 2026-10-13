@@ -290,7 +290,7 @@ func (s *Server) verify() (err error) {
 	// rebuildCachedLvolObjects makes SPDK JSON-RPC calls that may block
 	// for a long time (e.g. when spdk_tgt is busy with blobstore
 	// recovery during DiskCreate).  Run it WITHOUT the server lock so
-	// that gRPC handlers (EngineGet, EngineFrontendCreate, …) are not
+	// that gRPC handlers (EngineGet, EngineFrontendCreate, ...) are not
 	// starved.
 	if err = s.rebuildCachedLvolObjects(state); err != nil {
 		return err
@@ -808,7 +808,7 @@ func buildGRPCReplicaAddFrontendSuspendResumeWrapper(efName, efAddress string, l
 	return func(work func() error) error {
 		efClient, err := newServiceClient(efAddress)
 		if err != nil {
-			// Cannot connect to the EF node at all — proceed without suspension.
+			// Cannot connect to the EF node at all - proceed without suspension.
 			log.WithError(err).Warnf("Engine frontend %s at %s is unreachable, proceeding without suspension", efName, efAddress)
 			return work()
 		}
@@ -834,7 +834,7 @@ func buildGRPCReplicaAddFrontendSuspendResumeWrapper(efName, efAddress string, l
 
 		// Resume the frontend after the work.
 		// If resume fails (EF disappeared during work, or internal error),
-		// log a warning but do not override workErr — the replica-add result
+		// log a warning but do not override workErr - the replica-add result
 		// is determined by work(), not by resume. longhorn-manager will
 		// detect the stuck-suspended EF and handle recovery.
 		if suspended {
@@ -1019,7 +1019,7 @@ func (s *Server) engineFrontendByVolumeName(volumeName string) *EngineFrontend {
 func toEngineFrontendCreateGRPCError(err error, format string, args ...any) error {
 	code := grpccodes.Internal
 
-	// Check sentinel errors first — they are the most specific indicators
+	// Check sentinel errors first - they are the most specific indicators
 	// of what went wrong and should take priority over any embedded gRPC
 	// status that might exist deeper in the error chain.
 	switch {
@@ -1070,7 +1070,7 @@ func toExpansionGRPCError(err error, format string, args ...interface{}) error {
 		code = statusErr.Code()
 	} else {
 		switch {
-		case errors.Is(err, ErrExpansionInProgress), errors.Is(err, ErrRestoringInProgress):
+		case errors.Is(err, ErrExpansionInProgress), errors.Is(err, ErrRestoringInProgress), errors.Is(err, ErrEngineFrontendLifecyclePrecondition):
 			code = grpccodes.FailedPrecondition
 		case errors.Is(err, ErrExpansionInvalidSize):
 			code = grpccodes.InvalidArgument
@@ -1133,7 +1133,7 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 			continue
 		}
 
-		// Check volume uniqueness — a concurrent frontend lifecycle RPC may
+		// Check volume uniqueness - a concurrent frontend lifecycle RPC may
 		// already have registered an in-memory frontend for this volume while
 		// we were loading records from disk. Skip recovery so we do not race
 		// that in-memory owner on the host. The on-disk record may already
@@ -1221,7 +1221,7 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 		// the same subsystem NQN derived from the volume name).
 		unlockVolumeHost := s.acquireVolumeHostLock(ef.VolumeName)
 
-		// Read spdkClient fresh each iteration — clientReconnect() can
+		// Read spdkClient fresh each iteration - clientReconnect() can
 		// replace s.spdkClient and close the old one concurrently.
 		s.RLock()
 		spdkClient := s.spdkClient
@@ -1256,7 +1256,7 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 			}
 			s.Unlock()
 		} else {
-			// Recovery succeeded — verify the ef was not superseded by a
+			// Recovery succeeded - verify the ef was not superseded by a
 			// concurrent EngineFrontendCreate while RecoverFromHost was running.
 			s.RLock()
 			current := s.engineFrontendMap[record.Name]
@@ -1268,7 +1268,7 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 				// whether metadataDir should be kept (pre-create eviction,
 				// where no new record exists yet) or cleared (post-create
 				// eviction with successful Create, where a new record was
-				// written). Respect that decision — do not override here.
+				// written). Respect that decision - do not override here.
 				if deleteErr := ef.Delete(spdkClient); deleteErr != nil {
 					logrus.WithError(deleteErr).Warnf("Failed to clean up superseded engine frontend %s", record.Name)
 				}

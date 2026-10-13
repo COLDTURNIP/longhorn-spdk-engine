@@ -9,14 +9,14 @@ import (
 
 	"github.com/cockroachdb/errors"
 
+	. "gopkg.in/check.v1"
+
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	helpertypes "github.com/longhorn/go-spdk-helper/pkg/types"
 
 	clientpkg "github.com/longhorn/longhorn-spdk-engine/pkg/client"
 	lhtypes "github.com/longhorn/longhorn-spdk-engine/pkg/types"
-
-	. "gopkg.in/check.v1"
 )
 
 func (s *TestSuite) TestEngineFinishExpansionSuccessClearsErrorState(c *C) {
@@ -224,7 +224,7 @@ func (s *TestSuite) TestEngineExpandPrecheck(c *C) {
 		}
 		e.backends = ups
 
-		requireExpansion, err := e.ExpandPrecheck(nil, tc.target)
+		requireExpansion, err := e.precheckBackendExpansionNoLock(tc.target)
 		switch {
 		case tc.wantErrIs != nil:
 			c.Assert(errors.Is(err, tc.wantErrIs), Equals, true, Commentf("case=%s err=%v", tc.name, err))
@@ -327,8 +327,8 @@ func (s *TestSuite) TestExpandDoesNotBlockConcurrentGet(c *C) {
 	phase2ReadyCh := make(chan struct{})
 	allowPhase3Ch := make(chan struct{})
 
-	// Start a goroutine that simulates Phase 1 of Expand (lock → read → unlock)
-	// then holds a "long operation" before Phase 3 (re-lock → finishExpansion → unlock)
+	// Start a goroutine that simulates Phase 1 of Expand (lock -> read -> unlock)
+	// then holds a "long operation" before Phase 3 (re-lock -> finishExpansion -> unlock)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -368,7 +368,7 @@ func (s *TestSuite) TestExpandDoesNotBlockConcurrentGet(c *C) {
 		c.Assert(result, NotNil)
 		c.Assert(result.Name, Equals, "ef-a")
 	case <-time.After(2 * time.Second):
-		c.Fatal("Get() call was blocked — potential deadlock due to Expand holding lock during long operations")
+		c.Fatal("Get() call was blocked -- potential deadlock due to Expand holding lock during long operations")
 	}
 
 	// Get() completed; now allow Phase 3 to proceed and verify state update.
@@ -428,7 +428,7 @@ func (s *TestSuite) TestExpandResumeGuardsNilInitiator(c *C) {
 	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1), nil)
 	ef.initiator = nil
 
-	// Simulate the resume defer guard — should NOT panic.
+	// Simulate the resume defer guard -- should NOT panic.
 	c.Assert(func() {
 		if ef.initiator != nil {
 			_ = ef.initiator.Resume(helpertypes.DmsetupTimeout)

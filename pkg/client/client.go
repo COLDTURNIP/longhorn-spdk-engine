@@ -11,6 +11,10 @@ import (
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 )
 
+// ExpansionPhaseMetadataKey records frontend/backend quiescing across expansion RPCs.
+// It is workflow coordination, not an authorization mechanism.
+const ExpansionPhaseMetadataKey = "longhorn-expansion-phase"
+
 // Close closes the underlying gRPC connection for the SPDK service context.
 func (c *SPDKServiceContext) Close() error {
 	if c.cc != nil {
