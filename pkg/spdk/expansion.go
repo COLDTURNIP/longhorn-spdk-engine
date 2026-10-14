@@ -13,6 +13,12 @@ import (
 
 	"google.golang.org/grpc/metadata"
 
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+
+	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
+
+	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
 	helpertypes "github.com/longhorn/go-spdk-helper/pkg/types"
 
 	"github.com/longhorn/longhorn-spdk-engine/pkg/client"
@@ -24,6 +30,65 @@ const (
 	expansionRPCDeadline   = 10 * time.Second
 	expansionTimeout       = 90 * time.Second
 )
+
+// A resize failure can degrade a member only after backend feature restoration
+// is confirmed. All other errors retain the live graph for a conservative retry.
+var (
+	errExpansionReplicaResize = errors.New("replica growth failed")
+	errExpansionBackendUnsafe = errors.New("backend restoration is unconfirmed")
+)
+
+func expandReplicaBackends(ctx context.Context, names []string, grow, exclude func(string) error) (map[string]error, error) {
+	failed := map[string]error{}
+	for _, name := range names {
+		if err := grow(name); err != nil {
+			if ctx.Err() != nil || !errors.Is(err, errExpansionReplicaResize) || errors.Is(err, errExpansionBackendUnsafe) {
+				return failed, err
+			}
+			failed[name] = err
+		}
+	}
+	if len(failed) == len(names) {
+		return failed, fmt.Errorf("all replicas failed to expand; keeping the live RAID: %+v", aggregateReplicaErrors(failed))
+	}
+	for _, name := range names {
+		if failed[name] == nil {
+			continue
+		}
+		if err := exclude(name); err != nil {
+			return failed, fmt.Errorf("cannot exclude failed replica %s: %w", name, err)
+		}
+	}
+	return failed, nil
+}
+
+// Confirm removal even after a lost/false RPC response. Do not detach the
+// controller, delete the RAID, or advance advertised capacity on uncertainty.
+func removeExpansionRaidMember(ctx context.Context, raid, member string, rpc func(context.Context, string, any, any) error) error {
+	var removed bool
+	removeErr := rpc(ctx, "bdev_raid_remove_base_bdev", map[string]any{"name": member}, &removed)
+	for {
+		var bdevs []spdktypes.BdevInfo
+		if err := rpc(ctx, "bdev_get_bdevs", map[string]any{"name": raid}, &bdevs); err != nil {
+			return errors.Join(removeErr, err)
+		}
+		if len(bdevs) != 1 || bdevs[0].DriverSpecific == nil || bdevs[0].DriverSpecific.Raid == nil {
+			return errors.Join(removeErr, fmt.Errorf("cannot confirm live RAID %s membership", raid))
+		}
+		present := slices.ContainsFunc(bdevs[0].DriverSpecific.Raid.BaseBdevsList, func(b spdktypes.BaseBdev) bool { return b.Name == member })
+		if !present {
+			return nil
+		}
+		if removeErr != nil || !removed {
+			return errors.Join(removeErr, fmt.Errorf("failed member %s remains in RAID %s", member, raid))
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("failed member %s removal not confirmed: %w", member, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
 
 func hasExpansionPhase(ctx context.Context, value string) bool {
 	return slices.Contains(metadata.ValueFromIncomingContext(ctx, client.ExpansionPhaseMetadataKey), value)
@@ -38,7 +103,7 @@ func expansionPhase(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("expansion requires a single coordination phase")
 	}
 	switch phases[0] {
-	case "frontend-suspended", "backend-idle", "replica-precheck", "backend-masked":
+	case "frontend-suspended", "frontend-nvmf", "backend-idle", "replica-precheck", "backend-masked":
 		return phases[0], nil
 	default:
 		return "", fmt.Errorf("unknown expansion coordination phase %q", phases[0])
@@ -72,15 +137,18 @@ func expansionRPC(ctx context.Context, method string, params any, result any) er
 		return err
 	}
 	var response struct {
-		ID     int             `json:"id"`
-		Result json.RawMessage `json:"result"`
-		Error  json.RawMessage `json:"error"`
+		ID     int                    `json:"id"`
+		Result json.RawMessage        `json:"result"`
+		Error  *jsonrpc.ResponseError `json:"error"`
 	}
 	if err := json.NewDecoder(conn).Decode(&response); err != nil {
 		return fmt.Errorf("%s: %w", method, err)
 	}
-	if response.ID != 1 || (len(response.Error) != 0 && string(response.Error) != "null") {
-		return fmt.Errorf("%s response id=%d error=%s", method, response.ID, response.Error)
+	if response.ID != 1 {
+		return fmt.Errorf("%s response id=%d", method, response.ID)
+	}
+	if response.Error != nil {
+		return fmt.Errorf("%s: %w", method, response.Error)
 	}
 	return json.Unmarshal(response.Result, result)
 }
@@ -219,6 +287,20 @@ func resizeExpansionLvol(ctx context.Context, name string, size uint64, rpc func
 	}
 	var resized bool
 	resizeErr := rpc(ctx, "bdev_lvol_resize", map[string]any{"name": name, "size_in_mib": util.BytesToMiB(size)}, &resized)
+	// A definitive rejection plus an observed short head is a growth failure,
+	// not a capacity notification to wait for until the whole frontend deadline.
+	if _, rejected := errors.AsType[*jsonrpc.ResponseError](resizeErr); rejected || (resizeErr == nil && !resized) {
+		actual, observeErr := readExpansionBdevCapacity(ctx, name, rpc)
+		if ctx.Err() != nil || observeErr != nil {
+			return errors.Join(resizeErr, observeErr, ctx.Err())
+		}
+		if actual == size {
+			return nil
+		}
+		if actual < size {
+			return fmt.Errorf("%w: %w", errExpansionReplicaResize, errors.Join(resizeErr, fmt.Errorf("lvol %s rejected growth to %d; actual %d", name, size, actual)))
+		}
+	}
 	if err := waitExpansionCapacity(ctx, name, size, rpc); err != nil {
 		return errors.Join(resizeErr, err)
 	}
@@ -291,7 +373,13 @@ func resizeWithBackendRefresh(ctx context.Context, controller string, resize fun
 	return err
 }
 
-func resizeWithBackendRefreshKnown(ctx context.Context, controller string, knownOriginal uint32, hasKnownOriginal bool, resize func() error, rpc func(context.Context, string, any, any) error) (original uint32, captured bool, retErr error) {
+func resizeWithBackendRefreshKnown(ctx context.Context, controller string, knownOriginal uint32, hasKnownOriginal bool, resize func() error, rpc func(context.Context, string, any, any) error) (uint32, bool, error) {
+	return resizeWithDeferredBackendRefresh(ctx, controller, knownOriginal, hasKnownOriginal, resize, rpc, nil)
+}
+
+// A successful grow may transfer one masked backend to the engine. The engine
+// must refresh/restore it on every exit, after excluding confirmed failed members.
+func resizeWithDeferredBackendRefresh(ctx context.Context, controller string, knownOriginal uint32, hasKnownOriginal bool, resize func() error, rpc func(context.Context, string, any, any) error, hold func() bool) (original uint32, captured bool, retErr error) {
 	original, captured = knownOriginal, hasKnownOriginal
 	current, err := nvmeAECFeature(ctx, controller, false, 0, rpc)
 	if err != nil {
@@ -305,9 +393,14 @@ func resizeWithBackendRefreshKnown(ctx context.Context, controller string, known
 		}
 	}
 	defer func() {
+		if retErr == nil && ctx.Err() == nil && hold != nil && hold() {
+			return
+		}
 		cleanup, cancel := context.WithTimeout(context.Background(), 3*expansionRPCDeadline)
 		defer cancel()
-		retErr = errors.Join(retErr, resetAndRestoreBackend(cleanup, controller, original, rpc))
+		if err := resetAndRestoreBackend(cleanup, controller, original, rpc); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("%w: %w", errExpansionBackendUnsafe, err))
+		}
 	}()
 	if _, err := nvmeAECFeature(ctx, controller, true, original & ^nvmeNamespaceNoticeBit, rpc); err != nil {
 		return original, captured, err
@@ -316,5 +409,11 @@ func resizeWithBackendRefreshKnown(ctx context.Context, controller string, known
 	if err != nil || masked != original & ^nvmeNamespaceNoticeBit {
 		return original, captured, fmt.Errorf("backend %s notice mask not confirmed: got=%#x error=%v", controller, masked, err)
 	}
-	return original, captured, resize()
+	if err := resize(); err != nil {
+		if grpcstatus.Code(err) == grpccodes.Aborted {
+			return original, captured, fmt.Errorf("%w: %w", errExpansionReplicaResize, err)
+		}
+		return original, captured, err
+	}
+	return original, captured, nil
 }

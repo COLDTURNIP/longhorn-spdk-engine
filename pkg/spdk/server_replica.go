@@ -133,6 +133,9 @@ func (s *Server) ReplicaExpand(ctx context.Context, req *spdkrpc.ReplicaExpandRe
 			return nil, err
 		}
 	} else if err := r.Expand(ctx, spdkClient, req.Size); err != nil {
+		if errors.Is(err, errExpansionReplicaResize) {
+			return nil, grpcstatus.Error(grpccodes.Aborted, err.Error())
+		}
 		return nil, err
 	}
 

@@ -2872,9 +2872,9 @@ func (e *Engine) validateExpansionFrontendNoLock() error {
 		if e.NvmeTcpTarget != nil && (e.NvmeTcpTarget.Port != 0 || e.NvmeTcpTarget.Nqn != "" || e.NvmeTcpTarget.IP != "") {
 			return fmt.Errorf("frontendless expansion requires the temporary restore target to be stopped")
 		}
-	case types.FrontendSPDKTCPBlockdev:
+	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
 		if e.NvmeTcpTarget == nil || e.NvmeTcpTarget.ANAState != NvmeTCPANAStateOptimized {
-			return fmt.Errorf("live expansion requires an optimized NVMe/TCP block-device target")
+			return fmt.Errorf("live expansion requires an optimized NVMe/TCP target")
 		}
 	default:
 		return fmt.Errorf("expansion does not support frontend %q", e.Frontend)
@@ -2886,6 +2886,9 @@ func (e *Engine) validateExpansionFrontendNoLock() error {
 // not an environment switch or an authorization mechanism.
 func (e *Engine) validateExpansionCoordinationNoLock(ctx context.Context) error {
 	phase := "frontend-suspended"
+	if e.Frontend == types.FrontendSPDKTCPNvmf {
+		phase = "frontend-nvmf"
+	}
 	if e.Frontend == types.FrontendEmpty {
 		phase = "backend-idle"
 	}
@@ -2966,7 +2969,7 @@ func (e *Engine) Expand(ctx context.Context, size uint64) error {
 
 	// A failed attempt stays running at its old advertised size. The frontend
 	// sees LastExpansionError and will not reload dm or claim completion.
-	expandErr := func() error {
+	expandErr := func() (retErr error) {
 		if e.Frontend == types.FrontendEmpty {
 			if err := requireNoExpansionExport(ctx, getStableVolumeNQN(e.VolumeName), expansionRPC); err != nil {
 				return err
@@ -2982,16 +2985,39 @@ func (e *Engine) Expand(ctx context.Context, size uint64) error {
 			return err
 		}
 		defer e.closeReplicaClients(replicas)
-		for _, name := range slices.Sorted(maps.Keys(e.backends)) {
+		// Keep one healthy backend at its old cached size until failed members
+		// are removed. Its final refresh then emits the RAID resize event.
+		var held string
+		finishHeld := func() error {
+			if held == "" {
+				return nil
+			}
+			name := held
+			held = ""
+			cleanup, cancel := context.WithTimeout(context.Background(), 3*expansionRPCDeadline)
+			defer cancel()
+			if err := resetAndRestoreBackend(cleanup, name, e.expansionFeatures[name], expansionRPC); err != nil {
+				return fmt.Errorf("%w: %w", errExpansionBackendUnsafe, err)
+			}
+			return nil
+		}
+		defer func() { retErr = errors.Join(retErr, finishHeld()) }()
+		failed, err := expandReplicaBackends(ctx, slices.Sorted(maps.Keys(e.backends)), func(name string) error {
 			backend := e.backends[name]
 			replicaClient := replicas[name]
 			if replicaClient == nil {
 				return fmt.Errorf("missing replica client %s", name)
 			}
 			knownOriginal, hasKnownOriginal := e.expansionFeatures[name]
-			original, captured, err := resizeWithBackendRefreshKnown(ctx, name, knownOriginal, hasKnownOriginal, func() error {
+			original, captured, err := resizeWithDeferredBackendRefresh(ctx, name, knownOriginal, hasKnownOriginal, func() error {
 				return replicaClient.ReplicaExpandWithNoticeMasked(ctx, name, size)
-			}, expansionRPC)
+			}, expansionRPC, func() bool {
+				if held != "" {
+					return false
+				}
+				held = name
+				return true
+			})
 			if captured {
 				if e.expansionFeatures == nil {
 					e.expansionFeatures = map[string]uint32{}
@@ -3001,11 +3027,27 @@ func (e *Engine) Expand(ctx context.Context, size uint64) error {
 			if err != nil {
 				return err
 			}
+			if held == name {
+				return nil
+			}
 			if err := waitExpansionBdevCapacity(ctx, backend.BdevName(), size); err != nil {
 				return err
 			}
 			e.log.Infof("live-export replica %s reached %d; backend reset complete and notices restored", name, size)
-
+			return nil
+		}, func(name string) error {
+			return removeExpansionRaidMember(ctx, e.Name, e.backends[name].BdevName(), expansionRPC)
+		})
+		if err != nil {
+			return err
+		}
+		// Failed members have been confirmed absent from the live RAID. Their
+		// controllers remain available for ordinary manager-owned deletion.
+		if err := e.handleReplicaExpandResult(replicas, failed); err != nil {
+			return err
+		}
+		if err := finishHeld(); err != nil {
+			return err
 		}
 		return waitExpansionBdevCapacity(ctx, e.Name, size)
 	}()
@@ -3165,11 +3207,10 @@ func (e *Engine) handleReplicaExpandResult(replicaClients map[string]*client.SPD
 	if len(failed) == len(replicaClients) {
 		e.log.WithFields(logrus.Fields{"failedReplicas": aggregatedErr}).
 			Error("All replicas failed to expand")
-		return fmt.Errorf("all replicas failed to expand; aborting RAID recreation: %+v", aggregatedErr)
+		return fmt.Errorf("all replicas failed to expand; keeping the live RAID: %+v", aggregatedErr)
 	}
 
 	e.markReplicasERR(failed)
-	e.lastExpansionError = fmt.Sprintf("%+v", aggregatedErr)
 	e.log.WithFields(logrus.Fields{"failedReplicas": aggregatedErr}).
 		Warn("Some replicas failed to expand and have been marked as ERR")
 	return nil

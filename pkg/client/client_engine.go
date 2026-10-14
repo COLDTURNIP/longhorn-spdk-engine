@@ -215,6 +215,19 @@ func (c *SPDKClient) EngineExpandIdle(ctx context.Context, name string, size uin
 	return errors.Wrapf(err, "failed to expand idle engine %v", name)
 }
 
+// EngineExpandNvmf retains the target used by external NVMe initiators.
+// Unlike blockdev expansion, it does not claim ownership of their I/O suspension.
+func (c *SPDKClient) EngineExpandNvmf(ctx context.Context, name string, size uint64) error {
+	if name == "" {
+		return fmt.Errorf("failed to expand NVMf engine: missing required parameter")
+	}
+	ctx, cancel := context.WithTimeout(ctx, GRPCServiceTimeout)
+	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, ExpansionPhaseMetadataKey, "frontend-nvmf")
+	_, err := c.getSPDKServiceClient().EngineExpand(ctx, &spdkrpc.EngineExpandRequest{Name: name, Size: size})
+	return errors.Wrapf(err, "failed to expand NVMf engine %v", name)
+}
+
 // EngineExpandPrecheck validates whether the specified engine can be expanded to the requested size.
 func (c *SPDKClient) EngineExpandPrecheck(ctx context.Context, name string, size uint64) error {
 	if name == "" {

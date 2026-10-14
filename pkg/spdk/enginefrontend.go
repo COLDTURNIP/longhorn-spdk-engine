@@ -1129,10 +1129,10 @@ func (ef *EngineFrontend) isInitiatorCreationRequired(targetIP string) (bool, er
 	return ef.NvmeTcpFrontend.TargetPort == 0, nil
 }
 
-// Expand performs an online volume expansion for the Longhorn Engine using SPDK.
-// It quiesces frontend I/O while retaining NVMe identity, grows the backend,
-// synchronizes capacity, and resumes I/O even after a failed expansion attempt.
-func (ef *EngineFrontend) Expand(ctx context.Context, spdkClient *spdkclient.Client, size uint64) (retErr error) {
+// Expand grows the live engine without replacing its frontend target.
+// Blockdev I/O is quiesced locally; raw NVMf consumers keep their connections.
+// Only blockdev capacity synchronization needs a local dm initiator.
+func (ef *EngineFrontend) Expand(ctx context.Context, _ *spdkclient.Client, size uint64) (retErr error) {
 	ef.log.Info("Expanding engine frontend")
 
 	// Phase 1: Acquire lock to read state and check expansion guards.
@@ -1156,11 +1156,6 @@ func (ef *EngineFrontend) Expand(ctx context.Context, spdkClient *spdkclient.Cli
 	originalSize := ef.SpecSize
 	engineName := ef.EngineName
 	frontend := ef.Frontend
-
-	var targetAddress string
-	if ef.NvmeTcpFrontend != nil {
-		targetAddress = net.JoinHostPort(ef.NvmeTcpFrontend.TargetIP, strconv.Itoa(int(ef.NvmeTcpFrontend.TargetPort)))
-	}
 
 	engineSpdkClient, err := ef.newServiceClient(ef.getEngineServiceAddress())
 	if err != nil {
@@ -1221,13 +1216,20 @@ func (ef *EngineFrontend) Expand(ctx context.Context, spdkClient *spdkclient.Cli
 	if coordinationErr != nil {
 		return coordinationErr
 	}
-	if frontend == types.FrontendEmpty {
+	switch frontend {
+	case types.FrontendEmpty:
 		// No application or temporary restore initiator is attached. The engine
 		// checks this again and flushes its backends before resizing them.
 		if err := engineSpdkClient.EngineExpandIdle(ctx, engineName, size); err != nil {
 			return errors.Wrap(err, "idle frontendless engine expansion failed")
 		}
-	} else {
+	case types.FrontendSPDKTCPNvmf:
+		// External consumers have no Longhorn-owned dm device to suspend.
+		// Preserve their target and let SPDK handle backend reset I/O queuing.
+		if err := engineSpdkClient.EngineExpandNvmf(ctx, engineName, size); err != nil {
+			return errors.Wrap(err, "NVMf engine expansion failed")
+		}
+	case types.FrontendSPDKTCPBlockdev:
 		started := time.Now()
 		defer func() {
 			if err := ef.initiator.Resume(helpertypes.DmsetupTimeout); err != nil {
@@ -1258,25 +1260,11 @@ func (ef *EngineFrontend) Expand(ctx context.Context, spdkClient *spdkclient.Cli
 		return nil
 	}
 
-	// From here on the backend has already grown to size. A failure below means the
-	// frontend (nvme path / dm table) has not caught up yet, not that anything is
-	// broken: treat it the same as a backend partial failure (soft, retryable, keep
-	// SpecSize at originalSize) instead of a hard error, so the frontend instance is
-	// not flagged Error and the volume is not force detached/reattached over what is
-	// often just a transient dm resize timeout under heavy I/O.
-	if targetAddress != "" && !frontendSuspended {
-		if err := ef.handleFrontend(spdkClient, targetAddress); err != nil {
-			backendExpansionError = errors.Wrap(err, "failed to handle frontend").Error()
-			backendExpansionFailedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			ef.log.Warnf("Engine %s expanded backend to %v but frontend handling failed; keeping engine frontend size at %v: %v",
-				engineName, size, originalSize, backendExpansionError)
-			return nil
-		}
-	}
-
+	// The retained NVMf target publishes its new capacity to external consumers.
+	// Only the blockdev frontend needs local kernel/dm capacity synchronization.
 	// It waits for the kernel to recognize the new physical NVMe capacity
 	// and then reloads the dm table to propagate the size change up to the volume.
-	if frontend != types.FrontendEmpty && ef.initiator != nil {
+	if frontend == types.FrontendSPDKTCPBlockdev && ef.initiator != nil {
 		if err := ef.syncDmDeviceSizeForExpansion(size, frontendSuspended); err != nil {
 			backendExpansionError = errors.Wrapf(err, "failed to sync linear dm device size during engine %s expansion", engineName).Error()
 			backendExpansionFailedAt = time.Now().UTC().Format(time.RFC3339Nano)
@@ -1293,7 +1281,7 @@ func (ef *EngineFrontend) Expand(ctx context.Context, spdkClient *spdkclient.Cli
 }
 
 // Caller holds a frontend lock. An empty frontend is eligible only after the
-// temporary restore initiator has been removed; online I/O still requires dm.
+// temporary restore initiator has been removed; only blockdev uses a local dm device.
 func (ef *EngineFrontend) validateExpansionFrontendNoLock() error {
 	if ef.IsRestoring {
 		return fmt.Errorf("%w", ErrRestoringInProgress)
@@ -1306,6 +1294,10 @@ func (ef *EngineFrontend) validateExpansionFrontendNoLock() error {
 	case types.FrontendSPDKTCPBlockdev:
 		if ef.initiator == nil || ef.Endpoint == "" {
 			return fmt.Errorf("live expansion requires an attached NVMe/TCP dm frontend")
+		}
+	case types.FrontendSPDKTCPNvmf:
+		if ef.Endpoint == "" || ef.NvmeTcpFrontend == nil || ef.NvmeTcpFrontend.TargetIP == "" || ef.NvmeTcpFrontend.TargetPort == 0 {
+			return fmt.Errorf("live NVMf expansion requires an existing target endpoint")
 		}
 	default:
 		return fmt.Errorf("expansion does not support frontend %q", ef.Frontend)

@@ -270,7 +270,7 @@ func (s *TestSuite) TestHandleReplicaExpandResult(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(ePartial.backends["r1"].Mode(), Equals, lhtypes.Mode(lhtypes.ModeERR))
 	c.Assert(ePartial.backends["r2"].Mode(), Equals, lhtypes.Mode(lhtypes.ModeRW))
-	c.Assert(ePartial.lastExpansionError, Not(Equals), "")
+	c.Assert(ePartial.lastExpansionError, Equals, "")
 }
 
 func (s *TestSuite) TestExpandViaBackendResetGuards(c *C) {
